@@ -77,3 +77,9 @@ resource "google_project_iam_member" "reconcile-invoker" {
   role    = "roles/run.invoker"
   member  = "serviceAccount:${module.service-account-cloud-run-github-runners-manager.email}"
 }
+
+variable "setup_password" {
+  type        = string
+  sensitive   = true
+  description = "Basic auth password for the /setup/ endpoint"
+}

@@ -32,6 +32,10 @@ module "cloud_run_github_runners_manager" {
         GOOGLE_CLOUD_PROJECT = var.project_id
         GOOGLE_CLOUD_ZONE    = "${var.region}-${var.zone}"
         GITHUB_RUNNER_GROUP  = var.github_runner_group
+        # Without this the /setup/ basic auth password falls back to the
+        # project id, and completing that flow overwrites the stored GitHub
+        # App credentials.
+        SETUP_PASSWORD = var.setup_password
       }
       env_from_key = {
         GITHUB_APP_ID = {
