@@ -104,6 +104,13 @@ if ! id -u runner >/dev/null 2>&1; then
 fi
 sudo usermod -aG docker,google-sudoers runner
 
+# Use umask 022, matching GitHub-hosted runners. /etc/login.defs sets
+# UMASK 022, but USERGROUPS_ENAB yes lets pam_umask widen it to 002 for
+# users whose primary group name matches their username, which makes new
+# directories group-writable.
+sudo sed -i 's/^USERGROUPS_ENAB.*/USERGROUPS_ENAB no/' /etc/login.defs
+grep -q '^USERGROUPS_ENAB no$' /etc/login.defs || exit_with_failure "could not set USERGROUPS_ENAB"
+
 # Install GitHub Actions Runner
 echo "Installing GitHub Actions Runner..."
 MY_RUNNER_VERSION=$(curl -fsSL "https://api.github.com/repos/actions/runner/releases/latest" | jq -r '.tag_name' | sed 's/^v//')
