@@ -42,6 +42,14 @@ RUNNER_LABEL_PREFIX = os.environ.get('RECONCILE_LABEL_PREFIX', 'gcp-')
 BOOT_GRACE_SECONDS = int(os.environ.get('RECONCILE_BOOT_GRACE_SECONDS', '600'))
 # Ceiling per run, so a stuck queue cannot exhaust the instance quota.
 MAX_CREATE = int(os.environ.get('RECONCILE_MAX_CREATE', '10'))
+# Runners are ephemeral and deregister after one job, so a runner still
+# idle this long is surplus and will otherwise wait until max-run-duration.
+IDLE_GRACE_SECONDS = int(os.environ.get('RECONCILE_IDLE_GRACE_SECONDS', '1800'))
+# GitHub dispatches a queued job to an available runner within seconds. One
+# still queued long after that was already handed to a runner that then
+# died; GitHub does not redispatch it, so provisioning more runners cannot
+# help and only the workflow being re-run will clear it.
+STALE_JOB_SECONDS = int(os.environ.get('RECONCILE_STALE_JOB_SECONDS', '1800'))
 
 
 def _paged(url, token, key):
@@ -81,7 +89,8 @@ def queued_runner_jobs(token):
                     (l for l in job.get('labels', [])
                      if l.startswith(RUNNER_LABEL_PREFIX)), None)
                 if label:
-                    jobs[job['id']] = (full_name, job['id'], label)
+                    jobs[job['id']] = (full_name, job['id'], label,
+                                       job.get('started_at'))
     return list(jobs.values())
 
 
@@ -119,7 +128,21 @@ def main():
     gcloud = GCloudClient()
     token = github.get_installation_access_token()
 
-    queued = queued_runner_jobs(token)
+    all_queued = queued_runner_jobs(token)
+    now = datetime.now(timezone.utc)
+    queued, stale = [], []
+    for entry in all_queued:
+        started = entry[3]
+        age = (now - datetime.fromisoformat(started)).total_seconds() \
+            if started else 0
+        (stale if age >= STALE_JOB_SECONDS else queued).append(entry)
+
+    for repo, job_id, _, _ in stale:
+        logger.warning(
+            'job %s in %s has been queued over %ds and will not be '
+            'redispatched; re-run the workflow to clear it',
+            job_id, repo, STALE_JOB_SECONDS)
+
     runners = registered_runners(token, org)
     instances = runner_instances(gcloud)
 
@@ -128,15 +151,26 @@ def main():
                if name not in runners and age < BOOT_GRACE_SECONDS]
     orphans = [name for name, age in instances.items()
                if name not in runners and age >= BOOT_GRACE_SECONDS]
+    surplus = [name for name, age in instances.items()
+               if name in runners and not runners[name]
+               and age >= IDLE_GRACE_SECONDS]
 
     logger.info(
-        'queued=%d idle=%d booting=%d orphaned=%d registered=%d instances=%d',
-        len(queued), len(idle), len(booting), len(orphans),
-        len(runners), len(instances))
+        'queued=%d stale=%d idle=%d booting=%d orphaned=%d surplus=%d '
+        'registered=%d instances=%d',
+        len(queued), len(stale), len(idle), len(booting), len(orphans),
+        len(surplus), len(runners), len(instances))
 
     for name in orphans:
         logger.warning('deleting orphaned VM with no registered runner: %s', name)
         gcloud.delete_runner_instance(name)
+
+    for name in surplus:
+        logger.warning('deleting surplus VM idle for over %ds: %s',
+                       IDLE_GRACE_SECONDS, name)
+        gcloud.delete_runner_instance(name)
+
+    idle = [name for name in idle if name not in surplus]
 
     deficit = len(queued) - len(idle) - len(booting)
     if deficit <= 0:
@@ -148,7 +182,7 @@ def main():
         logger.warning('shortfall is %d, creating %d this run', deficit, creating)
 
     url = f'https://github.com/{org}'
-    for _, job_id, label in queued[:creating]:
+    for _, job_id, label, _ in queued[:creating]:
         registration_token = github.get_registration_token(org_name=org)
         name = gcloud.create_runner_instance(registration_token, url, label)
         logger.info('created %s for queued job %s (%s)', name, job_id, label)
