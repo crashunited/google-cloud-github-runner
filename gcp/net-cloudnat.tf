@@ -6,4 +6,16 @@ module "nat-github-runners" {
   region         = var.region
   name           = "cloudnat-github-runners-${local.region_shortnames[var.region]}"
   router_network = module.vpc-github-runners.self_link
+
+  # 64 ports per VM is not enough for jobs that open many parallel
+  # connections (package installs, image pulls); exhaustion surfaces as
+  # intermittent connection failures.
+  config_port_allocation = {
+    enable_dynamic_port_allocation      = true
+    enable_endpoint_independent_mapping = false
+    min_ports_per_vm                    = 128
+    max_ports_per_vm                    = 65536
+  }
+
+  logging_filter = "ERRORS_ONLY"
 }
