@@ -27,6 +27,11 @@ module "cloud_run_github_runners_manager" {
           memory = "512Mi"
         }
         startup_cpu_boost = false # We do not scale to zero.
+        # Throttle CPU between requests. min_instance_count keeps an instance
+        # warm so there is no cold start either way, but always-allocated CPU
+        # bills the full instance lifetime for a service that is idle almost
+        # all of the time.
+        cpu_idle = true
       }
       env = {
         GOOGLE_CLOUD_PROJECT = var.project_id
