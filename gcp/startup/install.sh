@@ -127,7 +127,47 @@ sudo tar xzf "actions-runner-linux-${MY_ARCH}-${MY_RUNNER_VERSION}.tar.gz"
 
 # Run the installation script
 sudo ./bin/installdependencies.sh
+sudo chown -R runner:runner "$MY_RUNNER_DIR"
 echo "GitHub Actions Runner installed successfully"
+
+# Tool cache and image identity, which GitHub-hosted runners provide.
+# actions/setup-node, setup-java, setup-python and ruby/setup-ruby read
+# ImageOS to pick a prebuilt release rather than building from source, and
+# expect RUNNER_TOOL_CACHE to name a writable directory. Runners are
+# ephemeral, so the cache is per-VM and only pays off for versions baked
+# into the image.
+sudo mkdir -p /opt/hostedtoolcache
+sudo chown runner:runner /opt/hostedtoolcache
+sudo chmod 0755 /opt/hostedtoolcache
+sudo -u runner tee "$MY_RUNNER_DIR/.env" >/dev/null <<'RUNNER_ENV'
+ImageOS=ubuntu24
+RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+RUNNER_ENV
+
+# Bake the Node versions the workflows ask for into the tool cache so
+# actions/setup-node resolves them locally instead of downloading on every
+# job. Layout matches what setup-node expects: <tool>/<version>/<arch>
+# alongside a .complete marker.
+case "$MY_ARCH" in
+	x64) MY_NODE_ARCH="x64" ;;
+	arm64) MY_NODE_ARCH="arm64" ;;
+	*) exit_with_failure "unsupported architecture for the Node tool cache: $MY_ARCH" ;;
+esac
+for MY_NODE_MAJOR in 22 24; do
+	MY_NODE_VERSION=$(curl -fsSL "https://nodejs.org/dist/index.json" \
+		| jq -r --arg major "v${MY_NODE_MAJOR}." \
+			'[.[] | select(.version | startswith($major))] | first | .version')
+	if [[ -z "$MY_NODE_VERSION" || "$MY_NODE_VERSION" == "null" ]]; then
+		exit_with_failure "could not resolve the latest Node ${MY_NODE_MAJOR} release"
+	fi
+	MY_NODE_DIR="/opt/hostedtoolcache/node/${MY_NODE_VERSION#v}/${MY_NODE_ARCH}"
+	echo "Caching Node ${MY_NODE_VERSION} for ${MY_NODE_ARCH}..."
+	sudo -u runner mkdir -p "$MY_NODE_DIR"
+	curl -fsSL "https://nodejs.org/dist/${MY_NODE_VERSION}/node-${MY_NODE_VERSION}-linux-${MY_NODE_ARCH}.tar.xz" \
+		| sudo -u runner tar -xJ --strip-components=1 -C "$MY_NODE_DIR"
+	sudo -u runner touch "/opt/hostedtoolcache/node/${MY_NODE_VERSION#v}/${MY_NODE_ARCH}.complete"
+done
 
 # Cleanup: Clear package cache and temporary files
 echo "Cleaning up..."
