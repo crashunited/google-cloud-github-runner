@@ -58,26 +58,31 @@ def _paged(url, token, key):
 
 def queued_runner_jobs(token):
     """Return (repo, job_id, label) for queued jobs wanting our runners."""
-    jobs = []
+    jobs = {}
     for repo in _paged(f'{API}/installation/repositories', token, 'repositories'):
         full_name = repo['full_name']
+        # A run can be listed under both states, and a queued job can belong
+        # to a run that is already in_progress, so collect run ids first and
+        # key jobs by id to avoid provisioning a VM twice for one job.
+        run_ids = set()
         for state in ('queued', 'in_progress'):
-            runs = _paged(
-                f'{API}/repos/{full_name}/actions/runs?status={state}&per_page=100',
-                token, 'workflow_runs')
-            for run in runs:
-                run_jobs = _paged(
-                    f'{API}/repos/{full_name}/actions/runs/{run["id"]}/jobs?per_page=100',
-                    token, 'jobs')
-                for job in run_jobs:
-                    if job.get('status') != 'queued':
-                        continue
-                    label = next(
-                        (l for l in job.get('labels', [])
-                         if l.startswith(RUNNER_LABEL_PREFIX)), None)
-                    if label:
-                        jobs.append((full_name, job['id'], label))
-    return jobs
+            run_ids.update(
+                run['id'] for run in _paged(
+                    f'{API}/repos/{full_name}/actions/runs?status={state}&per_page=100',
+                    token, 'workflow_runs'))
+        for run_id in run_ids:
+            run_jobs = _paged(
+                f'{API}/repos/{full_name}/actions/runs/{run_id}/jobs?per_page=100',
+                token, 'jobs')
+            for job in run_jobs:
+                if job.get('status') != 'queued':
+                    continue
+                label = next(
+                    (l for l in job.get('labels', [])
+                     if l.startswith(RUNNER_LABEL_PREFIX)), None)
+                if label:
+                    jobs[job['id']] = (full_name, job['id'], label)
+    return list(jobs.values())
 
 
 def registered_runners(token, org):

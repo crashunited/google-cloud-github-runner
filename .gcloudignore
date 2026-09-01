@@ -3,3 +3,4 @@
 !run.py
 !requirements.txt
 !Dockerfile
+!tools/**
