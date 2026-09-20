@@ -97,12 +97,28 @@ sudo apt-get install -y \
 sudo systemctl enable docker.service
 sudo systemctl start docker.service
 
+# Pull Docker Hub images through Google's public mirror. Every runner shares
+# one Cloud NAT address, so Docker Hub's per-address limit on anonymous pulls
+# would otherwise count the whole fleet as one client. The daemon falls back
+# to Docker Hub for anything the mirror has not cached.
+echo '{"registry-mirrors": ["https://mirror.gcr.io"]}' | sudo tee /etc/docker/daemon.json >/dev/null
+sudo systemctl restart docker.service
+
 # Create runner user and add to docker und sudoers group
 echo "Creating runner user..."
 if ! id -u runner >/dev/null 2>&1; then
 	sudo useradd -m runner
 fi
 sudo usermod -aG docker,google-sudoers runner
+
+# Builders created by docker buildx run their own BuildKit daemon, which reads
+# this file when no --config is passed, so FROM images resolve through the
+# same mirror.
+sudo -u runner mkdir -p /home/runner/.docker/buildx
+sudo -u runner tee /home/runner/.docker/buildx/buildkitd.default.toml >/dev/null <<'EOF'
+[registry."docker.io"]
+  mirrors = ["mirror.gcr.io"]
+EOF
 
 # Use umask 022, matching GitHub-hosted runners. /etc/login.defs sets
 # UMASK 022, but USERGROUPS_ENAB yes lets pam_umask widen it to 002 for
