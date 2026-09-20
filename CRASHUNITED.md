@@ -11,7 +11,7 @@ this branch carries local patches on top of it.
 | `gcp/startup/install.sh` | Sets `USERGROUPS_ENAB no` so the runner umask is 022. Ubuntu's pam_umask otherwise widens it to 002 for a user whose primary group matches its name, and the resulting group-writable directories fail permission assertions that pass on GitHub-hosted runners. |
 | `gcp/startup/install.sh` | Provides `/opt/hostedtoolcache`, `ImageOS`, `RUNNER_TOOL_CACHE` and `AGENT_TOOLSDIRECTORY`, and bakes the Node majors the workflows request. |
 | `gcp/net-cloudnat.tf` | Dynamic port allocation and `ERRORS_ONLY` logging. The 64-port default is not enough for jobs opening many parallel connections. |
-| `tools/reconcile.py`, `gcp/reconcile.tf` | Scheduled Cloud Run job. The manager creates one VM per `workflow_job` queued webhook and GitHub never redelivers it, so a VM that fails to register strands its job. Also reaps VMs whose runner never appeared and runners left idle. |
+| `tools/reconcile.py`, `gcp/reconcile.tf` | Scheduled Cloud Run job. The manager creates one VM per `workflow_job` queued webhook and GitHub never redelivers it, so a VM that fails to register strands its job. Also reaps VMs whose runner never appeared and runners left idle. Scans only the runner group's repositories, only runs created in the last 7 days, eight repositories at a time, and logs how long each phase took. |
 | `gcp/cloud-run.tf` | Requires a real `SETUP_PASSWORD`. The default falls back to the project id, and completing `/setup/` rewrites the stored GitHub App credentials. |
 | `.dockerignore`, `.gcloudignore` | Allow `tools/` into the container so the reconcile job ships. |
 
