@@ -51,9 +51,13 @@ class GitHubClient:
         try:
             private_key = self._get_private_key()
 
+            # GitHub rejects a token issued in the future, so the issued-at
+            # claim is backdated by the 60 seconds its documentation
+            # recommends to absorb clock drift.
+            now = int(time.time())
             payload = {
-                'iat': int(time.time()),
-                'exp': int(time.time()) + (10 * 60),
+                'iat': now - 60,
+                'exp': now + (10 * 60),
                 'iss': self.app_id
             }
 
