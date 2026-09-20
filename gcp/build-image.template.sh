@@ -77,6 +77,7 @@ echo "Disk image created: $IMAGE_NAME"
 # Templates reference the family, so only its newest image is ever used.
 for OLD_IMAGE in $(gcloud compute images list \
 	--project="${project_id}" \
+	--no-standard-images \
 	--filter="family=${image_name} AND name!=$IMAGE_NAME" \
 	--format="value(name)"); do
 	echo "Deleting superseded image: $OLD_IMAGE"
