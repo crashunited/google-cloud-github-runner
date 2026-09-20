@@ -62,7 +62,8 @@ echo ""
 
 # Step 3: Create disk image from the VM's boot disk
 echo "[3/4] Creating disk image from VM boot disk..."
-gcloud compute images create "${image_name}-v$(date -u +%Y-%m-%d)-$(date +%s)" \
+IMAGE_NAME="${image_name}-v$(date -u +%Y-%m-%d)-$(date +%s)"
+gcloud compute images create "$IMAGE_NAME" \
 	--project="${project_id}" \
 	--source-disk="$DISK_NAME" \
 	--source-disk-zone="${zone}" \
@@ -71,7 +72,18 @@ gcloud compute images create "${image_name}-v$(date -u +%Y-%m-%d)-$(date +%s)" \
 	--storage-location="${region}" \
 	--quiet
 
-echo "Disk image created: ${image_name}"
+echo "Disk image created: $IMAGE_NAME"
+
+# Templates reference the family, so only its newest image is ever used.
+for OLD_IMAGE in $(gcloud compute images list \
+	--project="${project_id}" \
+	--filter="family=${image_name} AND name!=$IMAGE_NAME" \
+	--format="value(name)"); do
+	echo "Deleting superseded image: $OLD_IMAGE"
+	gcloud compute images delete "$OLD_IMAGE" \
+		--project="${project_id}" \
+		--quiet
+done
 echo ""
 
 # Step 4: Delete the temporary VM
