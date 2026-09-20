@@ -44,6 +44,12 @@ module "cloud-run-github-runners-reconcile" {
       }
     }
   }
+  job_config = {
+    # The next scheduled tick is the retry, and a task that outlives the
+    # schedule interval would otherwise run alongside it.
+    max_retries = 0
+    timeout     = "240s"
+  }
   service_account_config = {
     create = false
     email  = module.service-account-cloud-run-github-runners-manager.email
