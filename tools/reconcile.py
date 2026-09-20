@@ -15,6 +15,7 @@ import importlib.util
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -50,15 +51,38 @@ IDLE_GRACE_SECONDS = int(os.environ.get('RECONCILE_IDLE_GRACE_SECONDS', '1800'))
 # died; GitHub does not redispatch it, so provisioning more runners cannot
 # help and only the workflow being re-run will clear it.
 STALE_JOB_SECONDS = int(os.environ.get('RECONCILE_STALE_JOB_SECONDS', '1800'))
+API_ATTEMPTS = int(os.environ.get('RECONCILE_API_ATTEMPTS', '3'))
+API_BACKOFF_SECONDS = float(os.environ.get('RECONCILE_API_BACKOFF_SECONDS', '2'))
+
+
+def _request(method, url, token, **kwargs):
+    """Call the GitHub API, retrying transient failures with backoff."""
+    headers = {'Authorization': f'Bearer {token}',
+               'Accept': 'application/vnd.github+json'}
+    last = None
+    for attempt in range(API_ATTEMPTS):
+        try:
+            response = requests.request(
+                method, url, headers=headers, timeout=30, **kwargs)
+            if response.status_code < 500 and response.status_code != 429:
+                response.raise_for_status()
+                return response
+            last = requests.HTTPError(
+                f'{response.status_code} from {url}', response=response)
+        except (requests.ConnectionError, requests.Timeout) as error:
+            last = error
+        if attempt + 1 < API_ATTEMPTS:
+            delay = API_BACKOFF_SECONDS * (2 ** attempt)
+            logger.warning('%s %s failed (%s); retrying in %ss',
+                           method, url, last, delay)
+            time.sleep(delay)
+    raise last
 
 
 def _paged(url, token, key):
     """Yield items from a paginated GitHub list endpoint."""
-    headers = {'Authorization': f'Bearer {token}',
-               'Accept': 'application/vnd.github+json'}
     while url:
-        response = requests.get(url, headers=headers, timeout=30)
-        response.raise_for_status()
+        response = _request('GET', url, token)
         payload = response.json()
         yield from (payload[key] if key else payload)
         url = response.links.get('next', {}).get('url')
@@ -95,12 +119,21 @@ def queued_runner_jobs(token):
 
 
 def registered_runners(token, org):
-    """Return {runner_name: busy} for runners GitHub currently knows about."""
+    """Return {runner_name: {id, busy, online}} for runners GitHub knows about."""
     return {
-        runner['name']: runner.get('busy', False)
+        runner['name']: {
+            'id': runner['id'],
+            'busy': runner.get('busy', False),
+            'online': runner.get('status') == 'online',
+        }
         for runner in _paged(f'{API}/orgs/{org}/actions/runners?per_page=100',
                              token, 'runners')
     }
+
+
+def delete_runner_registration(token, org, runner_id):
+    """Remove a runner registration from the organization."""
+    _request('DELETE', f'{API}/orgs/{org}/actions/runners/{runner_id}', token)
 
 
 def runner_instances(gcloud):
@@ -146,20 +179,33 @@ def main():
     runners = registered_runners(token, org)
     instances = runner_instances(gcloud)
 
-    idle = [name for name, busy in runners.items() if not busy]
+    # Only an online runner can accept a job. An offline registration whose VM
+    # is gone would otherwise be counted as spare capacity on every tick and
+    # suppress provisioning by one.
+    idle = [name for name, runner in runners.items()
+            if runner['online'] and not runner['busy']]
+    # A VM counts as usable only once its runner is online, whether that
+    # registration is missing or present but disconnected.
+    def unusable(name):
+        return name not in runners or not runners[name]['online']
+
     booting = [name for name, age in instances.items()
-               if name not in runners and age < BOOT_GRACE_SECONDS]
+               if unusable(name) and age < BOOT_GRACE_SECONDS]
     orphans = [name for name, age in instances.items()
-               if name not in runners and age >= BOOT_GRACE_SECONDS]
+               if unusable(name) and age >= BOOT_GRACE_SECONDS]
     surplus = [name for name, age in instances.items()
-               if name in runners and not runners[name]
+               if name in runners and runners[name]['online']
+               and not runners[name]['busy']
                and age >= IDLE_GRACE_SECONDS]
+    abandoned = [name for name, runner in runners.items()
+                 if not runner['online']
+                 and (name not in instances or name in orphans)]
 
     logger.info(
         'queued=%d stale=%d idle=%d booting=%d orphaned=%d surplus=%d '
-        'registered=%d instances=%d',
+        'abandoned=%d registered=%d instances=%d',
         len(queued), len(stale), len(idle), len(booting), len(orphans),
-        len(surplus), len(runners), len(instances))
+        len(surplus), len(abandoned), len(runners), len(instances))
 
     for name in orphans:
         logger.warning('deleting orphaned VM with no registered runner: %s', name)
@@ -169,6 +215,10 @@ def main():
         logger.warning('deleting surplus VM idle for over %ds: %s',
                        IDLE_GRACE_SECONDS, name)
         gcloud.delete_runner_instance(name)
+
+    for name in abandoned:
+        logger.warning('deregistering offline runner with no VM: %s', name)
+        delete_runner_registration(token, org, runners[name]['id'])
 
     idle = [name for name in idle if name not in surplus]
 
