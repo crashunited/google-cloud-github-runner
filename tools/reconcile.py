@@ -55,7 +55,9 @@ IDLE_GRACE_SECONDS = int(os.environ.get('RECONCILE_IDLE_GRACE_SECONDS', '1800'))
 # GitHub dispatches a queued job to an available runner within seconds. One
 # still queued long after that was already handed to a runner that then
 # died; GitHub does not redispatch it, so provisioning more runners cannot
-# help and only the workflow being re-run will clear it.
+# help and only the workflow being re-run will clear it. A job held back by
+# the compute quota also ages, so the quota must let a burst clear within
+# this time.
 STALE_JOB_SECONDS = int(os.environ.get('RECONCILE_STALE_JOB_SECONDS', '1800'))
 # Only runs created this recently are scanned. Anything older is long past
 # the stale threshold, and without the bound every run a repository has ever
@@ -261,6 +263,30 @@ def plan(queued, runners, instances):
     return Plan(idle, booting, orphans, surplus, abandoned, deficit)
 
 
+def create_runners(github, gcloud, org, jobs):
+    """Create one VM per job and return how many were created.
+
+    Creation stops at the first compute quota error. The jobs left over stay
+    queued and are picked up by a later tick once capacity frees up.
+    """
+    url = f'https://github.com/{org}'
+    created = 0
+    for _, job_id, label, _ in jobs:
+        registration_token = github.get_registration_token(org_name=org)
+        try:
+            name = gcloud.create_runner_instance(registration_token, url, label)
+        except Exception as error:
+            if 'QUOTA' not in str(error).upper():
+                raise
+            logger.warning(
+                'compute quota reached after creating %d of %d; the rest '
+                'wait for capacity: %s', created, len(jobs), error)
+            break
+        logger.info('created %s for queued job %s (%s)', name, job_id, label)
+        created += 1
+    return created
+
+
 def main():
     org = os.environ.get('GITHUB_ORG')
     if not org:
@@ -326,11 +352,7 @@ def main():
         logger.warning('shortfall is %d, creating %d this run',
                        result.deficit, creating)
 
-    url = f'https://github.com/{org}'
-    for _, job_id, label, _ in queued[:creating]:
-        registration_token = github.get_registration_token(org_name=org)
-        name = gcloud.create_runner_instance(registration_token, url, label)
-        logger.info('created %s for queued job %s (%s)', name, job_id, label)
+    create_runners(github, gcloud, org, queued[:creating])
     return 0
 
 
