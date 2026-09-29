@@ -36,6 +36,7 @@ module "cloud_run_github_runners_manager" {
       env = {
         GOOGLE_CLOUD_PROJECT = var.project_id
         GOOGLE_CLOUD_ZONE    = "${var.region}-${var.zone}"
+        GOOGLE_CLOUD_ZONES   = join(",", [for zone in distinct(concat([var.zone], var.fallback_zones)) : "${var.region}-${zone}"])
         GITHUB_RUNNER_GROUP  = var.github_runner_group
         # Without this the /setup/ basic auth password falls back to the
         # project id, and completing that flow overwrites the stored GitHub

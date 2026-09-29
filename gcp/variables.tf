@@ -60,6 +60,21 @@ variable "zone" {
   }
 }
 
+# Further zone suffixes (a-f) in the same region. Runners go to var.zone
+# first; when a zone has no capacity for the machine type, the manager and
+# the reconcile job use the next zone in this list.
+variable "fallback_zones" {
+  description = "Google Cloud zone suffixes to use when var.zone has no capacity"
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for zone in var.fallback_zones : contains(["a", "b", "c", "d", "e", "f"], zone)])
+    error_message = "Fallback zone suffixes must each be one of: a, b, c, d, e, f."
+  }
+}
+
 variable "github_runner_group" {
   description = "GitHub Actions runner group name passed to the Cloud Run service; blank disables --runnergroup"
   type        = string

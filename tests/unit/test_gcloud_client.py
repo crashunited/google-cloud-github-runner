@@ -1,7 +1,9 @@
 import pytest
 import logging
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
-from app.clients.gcloud_client import GCloudClient
+from google.api_core.exceptions import NotFound
+from app.clients.gcloud_client import GCloudClient, ZoneCapacityError
 
 
 @pytest.fixture
@@ -392,3 +394,169 @@ class TestGCloudClientDeliveryIdLogging:
         assert any(
             "gce-delerr-delivery-001" in r.message for r in caplog.records
         ), "delivery_id not found in error log on instance deletion failure"
+
+
+ZONES = 'us-central1-b,us-central1-a,us-central1-c'
+
+
+def _capacity_error():
+    error = Exception("The zone does not have enough resources available")
+    error.errors = [MagicMock(code='ZONE_RESOURCE_POOL_EXHAUSTED')]
+    return error
+
+
+def _operation(end_time, codes=(), operation_type='insert'):
+    operation = MagicMock()
+    operation.operation_type = operation_type
+    operation.end_time = end_time
+    operation.error.errors = [MagicMock(code=code) for code in codes]
+    return operation
+
+
+def _minutes_ago(minutes):
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+
+
+class TestZones:
+    @pytest.fixture
+    def zone_env(self, monkeypatch):
+        monkeypatch.setenv('GOOGLE_CLOUD_PROJECT', 'test-project')
+        monkeypatch.setenv('GOOGLE_CLOUD_ZONE', 'us-central1-b')
+        monkeypatch.setenv('GOOGLE_CLOUD_ZONES', ZONES)
+
+    @pytest.fixture
+    def compute(self, zone_env):
+        with patch('app.clients.gcloud_client.compute_v1') as mock_compute:
+            template = MagicMock()
+            template.name = 'gcp-ubuntu-24-04-12345678901234'
+            template.self_link = 'projects/test-project/regions/us-central1/instanceTemplates/' + template.name
+            mock_compute.RegionInstanceTemplatesClient.return_value.list.return_value = [template]
+            mock_compute.InsertInstanceRequest.side_effect = lambda **kwargs: kwargs
+            yield mock_compute
+
+    def _operations(self, compute, by_zone):
+        compute.ZoneOperationsClient.return_value.list.side_effect = \
+            lambda request: by_zone.get(request.zone, [])
+        compute.ListZoneOperationsRequest.side_effect = lambda **kwargs: MagicMock(**kwargs)
+
+    def _inserted_zones(self, compute):
+        return [c.kwargs['request']['zone'] for c in compute.InstancesClient.return_value.insert.call_args_list]
+
+    def test_zones_come_from_the_zone_list(self, compute):
+        client = GCloudClient()
+
+        assert client.zones == ['us-central1-b', 'us-central1-a', 'us-central1-c']
+        assert client.zone == 'us-central1-b'
+        assert client.region == 'us-central1'
+
+    def test_zones_outside_the_region_are_rejected(self, compute, monkeypatch):
+        monkeypatch.setenv('GOOGLE_CLOUD_ZONES', 'us-central1-b,us-east1-b')
+
+        with pytest.raises(ValueError, match='us-east1-b'):
+            GCloudClient()
+
+    def test_zone_order_moves_a_zone_out_of_capacity_last(self, compute):
+        self._operations(compute, {
+            'us-central1-b': [_operation(_minutes_ago(2), ['ZONE_RESOURCE_POOL_EXHAUSTED'])],
+            'us-central1-a': [_operation(_minutes_ago(5))],
+        })
+
+        assert GCloudClient().zone_order() == ['us-central1-a', 'us-central1-c', 'us-central1-b']
+
+    def test_zone_order_reads_the_latest_finished_insert(self, compute):
+        self._operations(compute, {'us-central1-b': [
+            _operation(_minutes_ago(1), operation_type='delete'),
+            _operation(''),
+            _operation(_minutes_ago(3)),
+            _operation(_minutes_ago(4), ['ZONE_RESOURCE_POOL_EXHAUSTED']),
+        ]})
+
+        assert GCloudClient().zone_order() == ['us-central1-b', 'us-central1-a', 'us-central1-c']
+
+    def test_zone_order_ignores_old_capacity_failures(self, compute):
+        self._operations(compute, {
+            'us-central1-b': [_operation(_minutes_ago(120), ['ZONE_RESOURCE_POOL_EXHAUSTED'])],
+        })
+
+        assert GCloudClient().zone_order() == ['us-central1-b', 'us-central1-a', 'us-central1-c']
+
+    def test_zone_order_keeps_the_configured_order_when_the_lookup_fails(self, compute):
+        compute.ZoneOperationsClient.return_value.list.side_effect = RuntimeError('permission denied')
+
+        assert GCloudClient().zone_order() == ['us-central1-b', 'us-central1-a', 'us-central1-c']
+
+    def test_waiting_create_falls_back_to_the_next_zone(self, compute):
+        self._operations(compute, {})
+        exhausted, created = MagicMock(), MagicMock()
+        exhausted.result.side_effect = _capacity_error()
+        compute.InstancesClient.return_value.insert.side_effect = [exhausted, created]
+
+        name = GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
+
+        assert name.startswith('gcp-runner-')
+        assert self._inserted_zones(compute) == ['us-central1-b', 'us-central1-a']
+        created.result.assert_called_once()
+
+    def test_waiting_create_raises_when_no_zone_has_capacity(self, compute):
+        self._operations(compute, {})
+        exhausted = MagicMock()
+        exhausted.result.side_effect = _capacity_error()
+        compute.InstancesClient.return_value.insert.return_value = exhausted
+
+        with pytest.raises(ZoneCapacityError):
+            GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
+        assert self._inserted_zones(compute) == ['us-central1-b', 'us-central1-a', 'us-central1-c']
+
+    def test_waiting_create_does_not_fall_back_on_other_errors(self, compute):
+        self._operations(compute, {})
+        failed = MagicMock()
+        failed.result.side_effect = RuntimeError('permission denied')
+        compute.InstancesClient.return_value.insert.return_value = failed
+
+        with pytest.raises(RuntimeError):
+            GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
+        assert self._inserted_zones(compute) == ['us-central1-b']
+
+    def test_waiting_create_leaves_a_slow_insert_to_finish(self, compute):
+        self._operations(compute, {})
+        slow = MagicMock()
+        slow.result.side_effect = TimeoutError()
+        compute.InstancesClient.return_value.insert.return_value = slow
+
+        name = GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
+
+        assert name.startswith('gcp-runner-')
+        assert self._inserted_zones(compute) == ['us-central1-b']
+
+    def test_create_without_wait_uses_the_first_zone_in_order(self, compute):
+        self._operations(compute, {
+            'us-central1-b': [_operation(_minutes_ago(2), ['ZONE_RESOURCE_POOL_EXHAUSTED'])],
+        })
+
+        GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04')
+
+        assert self._inserted_zones(compute) == ['us-central1-a']
+        compute.InstancesClient.return_value.insert.return_value.result.assert_not_called()
+
+    def test_delete_finds_the_instance_zone(self, compute):
+        instances = compute.InstancesClient.return_value
+        instances.delete.side_effect = [NotFound('missing'), MagicMock()]
+
+        GCloudClient().delete_runner_instance('gcp-runner-1')
+
+        assert [c.kwargs['zone'] for c in instances.delete.call_args_list] == ['us-central1-b', 'us-central1-a']
+
+    def test_delete_uses_a_known_zone(self, compute):
+        instances = compute.InstancesClient.return_value
+
+        GCloudClient().delete_runner_instance('gcp-runner-1', zone='us-central1-c')
+
+        instances.delete.assert_called_once_with(project='test-project', zone='us-central1-c', instance='gcp-runner-1')
+
+    def test_delete_of_a_missing_instance_logs_and_returns(self, compute, caplog):
+        compute.InstancesClient.return_value.delete.side_effect = NotFound('missing')
+
+        with caplog.at_level(logging.WARNING, logger='app.clients.gcloud_client'):
+            GCloudClient().delete_runner_instance('gcp-runner-1')
+
+        assert any('not found' in r.message for r in caplog.records)

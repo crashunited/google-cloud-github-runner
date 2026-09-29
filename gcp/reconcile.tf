@@ -25,6 +25,7 @@ module "cloud-run-github-runners-reconcile" {
       env = {
         GOOGLE_CLOUD_PROJECT = var.project_id
         GOOGLE_CLOUD_ZONE    = "${var.region}-${var.zone}"
+        GOOGLE_CLOUD_ZONES   = join(",", [for zone in distinct(concat([var.zone], var.fallback_zones)) : "${var.region}-${zone}"])
         GITHUB_RUNNER_GROUP  = var.github_runner_group
         GITHUB_ORG           = var.github_org
       }
@@ -48,7 +49,7 @@ module "cloud-run-github-runners-reconcile" {
     # The next scheduled tick is the retry, and a task that outlives the
     # schedule interval would otherwise run alongside it.
     max_retries = 0
-    timeout     = "240s"
+    timeout     = "290s"
   }
   service_account_config = {
     create = false
