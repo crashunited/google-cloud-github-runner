@@ -221,6 +221,7 @@ graph TD
 | `GITHUB_WEBHOOK_SECRET`   | Webhook signature secret       | Yes                                        |
 | `GOOGLE_CLOUD_PROJECT`    | Google Cloud Project ID        | Yes                                        |
 | `GOOGLE_CLOUD_ZONE`       | Default GCP zone for runners   | No (default: `us-central1-a`)              |
+| `GOOGLE_CLOUD_ZONES`      | Comma-separated zones, in order of preference; overrides `GOOGLE_CLOUD_ZONE` | No |
 | `PORT`                    | Web server port                | No (default: `8080`)                       |
 | `SETUP_USERNAME`          | Setup authentication username  | No (default: `cloud`)                      |
 | `SETUP_PASSWORD`          | Setup authentication password  | No (default: `GOOGLE_CLOUD_PROJECT`)       |

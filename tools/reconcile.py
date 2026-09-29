@@ -40,7 +40,9 @@ def _load(name, relpath):
     return module
 
 
-GCloudClient = _load('gcloud_client', 'app/clients/gcloud_client.py').GCloudClient
+_gcloud_client = _load('gcloud_client', 'app/clients/gcloud_client.py')
+GCloudClient = _gcloud_client.GCloudClient
+ZoneCapacityError = _gcloud_client.ZoneCapacityError
 GitHubClient = _load('github_client', 'app/clients/github_client.py').GitHubClient
 
 API = 'https://api.github.com'
@@ -209,17 +211,19 @@ def delete_runner_registration(token, org, runner_id):
 
 
 def runner_instances(gcloud):
-    """Return {instance_name: age_seconds} for runner VMs in the project."""
+    """Return {instance_name: age_seconds} for runner VMs in every zone the
+    manager creates them in."""
     from google.cloud import compute_v1
-    request = compute_v1.ListInstancesRequest(
-        project=gcloud.project_id, zone=gcloud.zone)
     now = datetime.now(timezone.utc)
     instances = {}
-    for instance in gcloud.instance_client.list(request=request):
-        if not instance.name.startswith('gcp-runner-'):
-            continue
-        created = datetime.fromisoformat(instance.creation_timestamp)
-        instances[instance.name] = (now - created).total_seconds()
+    for zone in gcloud.zones:
+        request = compute_v1.ListInstancesRequest(
+            project=gcloud.project_id, zone=zone)
+        for instance in gcloud.instance_client.list(request=request):
+            if not instance.name.startswith('gcp-runner-'):
+                continue
+            created = datetime.fromisoformat(instance.creation_timestamp)
+            instances[instance.name] = (now - created).total_seconds()
     return instances
 
 
@@ -266,24 +270,47 @@ def plan(queued, runners, instances):
 def create_runners(github, gcloud, org, jobs):
     """Create one VM per job and return how many were created.
 
-    Creation stops at the first compute quota error. The jobs left over stay
-    queued and are picked up by a later tick once capacity frees up.
+    The VMs are created concurrently and each insert is followed to
+    completion, so a zone without capacity hands the VM to the next zone.
+    A job that hits the compute quota or finds no zone with capacity stays
+    queued for a later tick. Any other failure is raised once every insert
+    has finished.
     """
+    if not jobs:
+        return 0
     url = f'https://github.com/{org}'
-    created = 0
-    for _, job_id, label, _ in jobs:
-        registration_token = github.get_registration_token(org_name=org)
+    # A registration token registers any number of runners until it expires
+    # an hour later, so the batch shares one.
+    token = github.get_registration_token(org_name=org)
+
+    def create(job):
+        _, job_id, label, _ = job
         try:
-            name = gcloud.create_runner_instance(registration_token, url, label)
+            name = gcloud.create_runner_instance(token, url, label, wait=True)
+        except ZoneCapacityError as error:
+            logger.warning('no zone has capacity for queued job %s; it waits '
+                           'for a later tick: %s', job_id, error)
+            return None
         except Exception as error:
             if 'QUOTA' not in str(error).upper():
                 raise
-            logger.warning(
-                'compute quota reached after creating %d of %d; the rest '
-                'wait for capacity: %s', created, len(jobs), error)
-            break
+            logger.warning('compute quota reached for queued job %s; it waits '
+                           'for capacity: %s', job_id, error)
+            return None
         logger.info('created %s for queued job %s (%s)', name, job_id, label)
-        created += 1
+        return name
+
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = [pool.submit(create, job) for job in jobs]
+    created = 0
+    failure = None
+    for future in futures:
+        try:
+            created += future.result() is not None
+        except Exception as error:
+            failure = failure or error
+    if failure:
+        raise failure
     return created
 
 

@@ -25,6 +25,7 @@ module "cloud-run-github-runners-reconcile" {
       env = {
         GOOGLE_CLOUD_PROJECT = var.project_id
         GOOGLE_CLOUD_ZONE    = "${var.region}-${var.zone}"
+        GOOGLE_CLOUD_ZONES   = join(",", [for zone in distinct(concat([var.zone], var.fallback_zones)) : "${var.region}-${zone}"])
         GITHUB_RUNNER_GROUP  = var.github_runner_group
         GITHUB_ORG           = var.github_org
       }

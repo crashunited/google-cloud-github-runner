@@ -319,36 +319,86 @@ class TestPlan:
 
 
 class TestCreateRunners:
-    JOBS = [('org/repo', 1, 'gcp-x', None), ('org/repo', 2, 'gcp-x', None),
-            ('org/repo', 3, 'gcp-x', None)]
+    JOBS = [('org/repo', 1, 'gcp-1', None), ('org/repo', 2, 'gcp-2', None),
+            ('org/repo', 3, 'gcp-3', None)]
 
     def _clients(self, create_results):
         github = Mock()
         github.get_registration_token.return_value = 'reg'
         gcloud = Mock()
-        gcloud.create_runner_instance.side_effect = create_results
+        results = dict(zip((job[2] for job in self.JOBS), create_results))
+
+        def create(token, url, label, wait):
+            result = results[label]
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        gcloud.create_runner_instance.side_effect = create
         return github, gcloud
 
-    def test_creates_one_vm_per_job(self):
+    def test_creates_one_vm_per_job_waiting_for_each_insert(self):
         github, gcloud = self._clients(['vm-1', 'vm-2', 'vm-3'])
 
         created = reconcile.create_runners(github, gcloud, 'org', self.JOBS)
 
         assert created == 3
+        github.get_registration_token.assert_called_once_with(org_name='org')
+        assert sorted(c.args[2] for c in gcloud.create_runner_instance.call_args_list) == ['gcp-1', 'gcp-2', 'gcp-3']
         gcloud.create_runner_instance.assert_called_with(
-            'reg', 'https://github.com/org', 'gcp-x')
+            'reg', 'https://github.com/org', 'gcp-3', wait=True)
 
-    def test_stops_at_the_compute_quota(self):
+    def test_jobs_over_the_compute_quota_wait_for_a_later_tick(self):
         github, gcloud = self._clients(
             ['vm-1', Exception("Quota 'E2_CPUS' exceeded. Limit: 24.0"), 'vm-3'])
 
         created = reconcile.create_runners(github, gcloud, 'org', self.JOBS)
 
-        assert created == 1
-        assert gcloud.create_runner_instance.call_count == 2
+        assert created == 2
 
-    def test_other_errors_propagate(self):
-        github, gcloud = self._clients(['vm-1', RuntimeError('permission denied')])
+    def test_jobs_without_zone_capacity_wait_for_a_later_tick(self):
+        github, gcloud = self._clients(
+            [reconcile.ZoneCapacityError('no capacity'), 'vm-2', 'vm-3'])
+
+        created = reconcile.create_runners(github, gcloud, 'org', self.JOBS)
+
+        assert created == 2
+
+    def test_other_errors_propagate_after_every_insert_finishes(self):
+        github, gcloud = self._clients(['vm-1', RuntimeError('permission denied'), 'vm-3'])
 
         with pytest.raises(RuntimeError):
             reconcile.create_runners(github, gcloud, 'org', self.JOBS)
+        assert gcloud.create_runner_instance.call_count == 3
+
+    def test_no_jobs_creates_nothing(self):
+        github, gcloud = self._clients([])
+
+        assert reconcile.create_runners(github, gcloud, 'org', []) == 0
+        github.get_registration_token.assert_not_called()
+        gcloud.create_runner_instance.assert_not_called()
+
+
+class TestRunnerInstances:
+    def test_lists_runner_vms_in_every_zone(self):
+        now = datetime.now(timezone.utc)
+
+        def instance(name, minutes):
+            vm = Mock()
+            vm.name = name
+            vm.creation_timestamp = (now - timedelta(minutes=minutes)).isoformat()
+            return vm
+
+        by_zone = {
+            'us-central1-b': [instance('gcp-runner-b', 1), instance('builder', 1)],
+            'us-central1-a': [instance('gcp-runner-a', 10)],
+        }
+        gcloud = Mock()
+        gcloud.project_id = 'p'
+        gcloud.zones = ['us-central1-b', 'us-central1-a']
+        gcloud.instance_client.list.side_effect = lambda request: by_zone[request.zone]
+
+        instances = reconcile.runner_instances(gcloud)
+
+        assert set(instances) == {'gcp-runner-b', 'gcp-runner-a'}
+        assert 550 < instances['gcp-runner-a'] < 650
