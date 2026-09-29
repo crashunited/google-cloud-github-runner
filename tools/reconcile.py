@@ -276,10 +276,14 @@ def create_runners(github, gcloud, org, jobs):
     queued for a later tick. Any other failure is raised once every insert
     has finished.
     """
+    if not jobs:
+        return 0
     url = f'https://github.com/{org}'
-    tokens = [github.get_registration_token(org_name=org) for _ in jobs]
+    # A registration token registers any number of runners until it expires
+    # an hour later, so the batch shares one.
+    token = github.get_registration_token(org_name=org)
 
-    def create(job, token):
+    def create(job):
         _, job_id, label, _ = job
         try:
             name = gcloud.create_runner_instance(token, url, label, wait=True)
@@ -296,10 +300,8 @@ def create_runners(github, gcloud, org, jobs):
         logger.info('created %s for queued job %s (%s)', name, job_id, label)
         return name
 
-    if not jobs:
-        return 0
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = [pool.submit(create, job, token) for job, token in zip(jobs, tokens)]
+        futures = [pool.submit(create, job) for job in jobs]
     created = 0
     failure = None
     for future in futures:

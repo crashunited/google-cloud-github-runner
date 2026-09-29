@@ -319,19 +319,17 @@ class TestPlan:
 
 
 class TestCreateRunners:
-    JOBS = [('org/repo', 1, 'gcp-x', None), ('org/repo', 2, 'gcp-x', None),
-            ('org/repo', 3, 'gcp-x', None)]
+    JOBS = [('org/repo', 1, 'gcp-1', None), ('org/repo', 2, 'gcp-2', None),
+            ('org/repo', 3, 'gcp-3', None)]
 
     def _clients(self, create_results):
         github = Mock()
         github.get_registration_token.return_value = 'reg'
         gcloud = Mock()
-        results = dict(zip((job[1] for job in self.JOBS), create_results))
-        tokens = iter(range(len(self.JOBS)))
-        github.get_registration_token.side_effect = lambda org_name: f'reg-{next(tokens) + 1}'
+        results = dict(zip((job[2] for job in self.JOBS), create_results))
 
         def create(token, url, label, wait):
-            result = results[int(token.split('-')[1])]
+            result = results[label]
             if isinstance(result, Exception):
                 raise result
             return result
@@ -345,8 +343,10 @@ class TestCreateRunners:
         created = reconcile.create_runners(github, gcloud, 'org', self.JOBS)
 
         assert created == 3
+        github.get_registration_token.assert_called_once_with(org_name='org')
+        assert sorted(c.args[2] for c in gcloud.create_runner_instance.call_args_list) == ['gcp-1', 'gcp-2', 'gcp-3']
         gcloud.create_runner_instance.assert_called_with(
-            'reg-3', 'https://github.com/org', 'gcp-x', wait=True)
+            'reg', 'https://github.com/org', 'gcp-3', wait=True)
 
     def test_jobs_over_the_compute_quota_wait_for_a_later_tick(self):
         github, gcloud = self._clients(
@@ -375,6 +375,7 @@ class TestCreateRunners:
         github, gcloud = self._clients([])
 
         assert reconcile.create_runners(github, gcloud, 'org', []) == 0
+        github.get_registration_token.assert_not_called()
         gcloud.create_runner_instance.assert_not_called()
 
 

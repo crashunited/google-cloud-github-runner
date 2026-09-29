@@ -2,7 +2,7 @@ import pytest
 import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch, MagicMock
-from google.api_core.exceptions import NotFound
+from google.api_core.exceptions import NotFound, ServiceUnavailable
 from app.clients.gcloud_client import GCloudClient, ZoneCapacityError
 
 
@@ -399,16 +399,11 @@ class TestGCloudClientDeliveryIdLogging:
 ZONES = 'us-central1-b,us-central1-a,us-central1-c'
 
 
-def _capacity_error():
-    error = Exception("The zone does not have enough resources available")
-    error.errors = [MagicMock(code='ZONE_RESOURCE_POOL_EXHAUSTED')]
-    return error
-
-
-def _operation(end_time, codes=(), operation_type='insert'):
+def _operation(end_time, codes=(), operation_type='insert', target='gcp-runner-1'):
     operation = MagicMock()
     operation.operation_type = operation_type
     operation.end_time = end_time
+    operation.target_link = f'https://www.googleapis.com/compute/v1/projects/p/zones/z/instances/{target}'
     operation.error.errors = [MagicMock(code=code) for code in codes]
     return operation
 
@@ -436,8 +431,18 @@ class TestZones:
 
     def _operations(self, compute, by_zone):
         compute.ZoneOperationsClient.return_value.list.side_effect = \
-            lambda request: by_zone.get(request.zone, [])
+            lambda request, **kwargs: by_zone.get(request.zone, [])
         compute.ListZoneOperationsRequest.side_effect = lambda **kwargs: MagicMock(**kwargs)
+
+    def _outcomes(self, compute, *codes):
+        """Make zoneOperations.wait report each insert done with these error codes, in order."""
+        done = []
+        for errors in codes:
+            operation = MagicMock()
+            operation.status = compute.Operation.Status.DONE
+            operation.error.errors = [MagicMock(code=code) for code in errors]
+            done.append(operation)
+        compute.ZoneOperationsClient.return_value.wait.side_effect = done
 
     def _inserted_zones(self, compute):
         return [c.kwargs['request']['zone'] for c in compute.InstancesClient.return_value.insert.call_args_list]
@@ -473,6 +478,23 @@ class TestZones:
 
         assert GCloudClient().zone_order() == ['us-central1-b', 'us-central1-a', 'us-central1-c']
 
+    def test_zone_order_counts_only_runner_instance_inserts(self, compute):
+        self._operations(compute, {'us-central1-b': [
+            _operation(_minutes_ago(1), target='image-builder'),
+            _operation(_minutes_ago(2), ['ZONE_RESOURCE_POOL_EXHAUSTED']),
+        ]})
+
+        assert GCloudClient().zone_order()[-1] == 'us-central1-b'
+
+    def test_zone_order_bounds_the_lookup(self, compute):
+        self._operations(compute, {})
+
+        GCloudClient().zone_order()
+
+        for call in compute.ZoneOperationsClient.return_value.list.call_args_list:
+            assert call.kwargs['retry'] is None
+            assert call.kwargs['timeout'] <= 3
+
     def test_zone_order_ignores_old_capacity_failures(self, compute):
         self._operations(compute, {
             'us-central1-b': [_operation(_minutes_ago(120), ['ZONE_RESOURCE_POOL_EXHAUSTED'])],
@@ -487,21 +509,19 @@ class TestZones:
 
     def test_waiting_create_falls_back_to_the_next_zone(self, compute):
         self._operations(compute, {})
-        exhausted, created = MagicMock(), MagicMock()
-        exhausted.result.side_effect = _capacity_error()
-        compute.InstancesClient.return_value.insert.side_effect = [exhausted, created]
+        self._outcomes(compute, ['ZONE_RESOURCE_POOL_EXHAUSTED'], [])
 
         name = GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
 
         assert name.startswith('gcp-runner-')
         assert self._inserted_zones(compute) == ['us-central1-b', 'us-central1-a']
-        created.result.assert_called_once()
+        waits = compute.ZoneOperationsClient.return_value.wait.call_args_list
+        assert [c.kwargs['zone'] for c in waits] == ['us-central1-b', 'us-central1-a']
+        assert all(c.kwargs['retry'] is None and c.kwargs['timeout'] <= 45 for c in waits)
 
     def test_waiting_create_raises_when_no_zone_has_capacity(self, compute):
         self._operations(compute, {})
-        exhausted = MagicMock()
-        exhausted.result.side_effect = _capacity_error()
-        compute.InstancesClient.return_value.insert.return_value = exhausted
+        self._outcomes(compute, *[['ZONE_RESOURCE_POOL_EXHAUSTED']] * 3)
 
         with pytest.raises(ZoneCapacityError):
             GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
@@ -509,19 +529,27 @@ class TestZones:
 
     def test_waiting_create_does_not_fall_back_on_other_errors(self, compute):
         self._operations(compute, {})
-        failed = MagicMock()
-        failed.result.side_effect = RuntimeError('permission denied')
-        compute.InstancesClient.return_value.insert.return_value = failed
+        self._outcomes(compute, ['QUOTA_EXCEEDED'])
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match='QUOTA_EXCEEDED'):
             GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
         assert self._inserted_zones(compute) == ['us-central1-b']
 
-    def test_waiting_create_leaves_a_slow_insert_to_finish(self, compute):
+    def test_waiting_create_retries_a_failed_wait(self, compute):
         self._operations(compute, {})
-        slow = MagicMock()
-        slow.result.side_effect = TimeoutError()
-        compute.InstancesClient.return_value.insert.return_value = slow
+        done = MagicMock()
+        done.status = compute.Operation.Status.DONE
+        done.error.errors = []
+        compute.ZoneOperationsClient.return_value.wait.side_effect = [ServiceUnavailable('busy'), done]
+
+        with patch('app.clients.gcloud_client.time.sleep'):
+            GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
+
+        assert self._inserted_zones(compute) == ['us-central1-b']
+
+    def test_waiting_create_leaves_a_slow_insert_to_finish(self, compute, monkeypatch):
+        self._operations(compute, {})
+        monkeypatch.setattr('app.clients.gcloud_client.INSERT_TIMEOUT_SECONDS', 0)
 
         name = GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04', wait=True)
 
@@ -536,7 +564,7 @@ class TestZones:
         GCloudClient().create_runner_instance('token', 'https://github.com/org', 'gcp-ubuntu-24.04')
 
         assert self._inserted_zones(compute) == ['us-central1-a']
-        compute.InstancesClient.return_value.insert.return_value.result.assert_not_called()
+        compute.ZoneOperationsClient.return_value.wait.assert_not_called()
 
     def test_delete_finds_the_instance_zone(self, compute):
         instances = compute.InstancesClient.return_value
